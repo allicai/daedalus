@@ -334,6 +334,7 @@ def prepare_fabricated_image(instance_id: str, diff: str) -> tuple[str, str | No
         container = client.containers.run(
             image_name, "bash", detach=True, tty=True, working_dir="/testbed"
         )
+        diff = diff.replace("\r\n", "\n").replace("\r", "\n")
         _put_file_in_container(container, "_fab.diff", diff)
         exit_code, output = container.exec_run(
             ["bash", "-c",

@@ -2,6 +2,106 @@
 
 Daedalus is a research framework for studying whether controlled ownership-boundary ambiguity in bug reports can systematically redirect coding-agent reasoning. It generates variants of [SWE-bench Verified](https://www.swebench.com/) tasks by appending a competing (incorrect) causal hypothesis to the problem statement, then measures whether agents investigating the variant diverge in trajectory and diagnosis from the original.
 
+## System Architecture
+
+### Pipeline Overview
+
+```mermaid
+flowchart LR
+    SWE["SWE-bench\nVerified"]
+
+    subgraph P1["Phase 1 · Task Generation"]
+        direction TB
+        G["Variant Generator\nLlama 3.3 70B"]
+        V["Validator\nDeepSeek V4 Pro"]
+        T[("116 validated\ntasks")]
+        G --> V --> T
+    end
+
+    subgraph P2["Phase 2 · Artifact Fabrication"]
+        direction TB
+        F["Fabricator\nDeepSeek V4 Pro"]
+        GATE{"Programmatic\ngates"}
+        HR["Human Review"]
+        A[("Approved\nartifacts")]
+        F --> GATE -->|pass| HR -->|approve| A
+        GATE -->|fail| REJ["auto-rejected"]
+    end
+
+    subgraph P3["Phase 3 · Evaluation"]
+        direction TB
+        IMG["Fabricated\nDocker image"]
+        AGENT["mini-SWE-agent\n× 2 conditions"]
+        CMP["compare_pair()"]
+        R[("fab_pairs.jsonl")]
+        IMG --> AGENT --> CMP --> R
+    end
+
+    SWE --> P1
+    T --> P2
+    T --> P3
+    A --> P3
+```
+
+### Fabrication Gate Cascade
+
+```mermaid
+flowchart TD
+    LLM["LLM Fabricator\n(proposes artifacts)"]
+
+    TF{"text_not_found"}
+    CC{"Class C detector\ncontrol-flow · rename\ndeletion-as-comment"}
+    SC{"Docker safety\nPASS_TO_PASS regression?\nGold patch still resolves?"}
+    HR["Human Review"]
+
+    AR(["auto-rejected"])
+    FAB[("fabrications.jsonl")]
+    REJ[("rejected_fabrications.jsonl")]
+
+    LLM --> TF
+    TF -->|"original text\nnot found in file"| AR
+    TF -->|found| CC
+    CC -->|violation| AR
+    CC -->|clean| SC
+    SC -->|regression| AR
+    SC -->|passes| HR
+    HR -->|approve| FAB
+    HR -->|reject| REJ
+    AR --> REJ
+```
+
+### Fabricated Evaluation Flow
+
+```mermaid
+sequenceDiagram
+    participant CLI
+    participant Docker
+    participant Agent as mini-SWE-agent
+    participant Tests
+
+    CLI->>Docker: pull sweb.eval.<task>:latest
+
+    rect rgb(220,240,255)
+        Note over CLI,Tests: Original condition
+        CLI->>Agent: run on clean image
+        Agent-->>CLI: model_patch
+        CLI->>Tests: evaluate_patch(model_patch)
+        Tests-->>CLI: resolved = True/False
+    end
+
+    rect rgb(255,235,220)
+        Note over CLI,Docker: Variant condition
+        CLI->>Docker: start container, git apply <fab.diff>, commit as same tag
+        CLI->>Agent: run on modified image
+        Agent-->>CLI: model_patch
+        CLI->>Docker: restore original image tag
+        CLI->>Tests: evaluate_patch(model_patch)
+        Tests-->>CLI: resolved = True/False
+    end
+
+    CLI->>CLI: compare_pair() → EvaluationBucket
+```
+
 ## Research Motivation
 
 Coding agents investigating a bug must not only find relevant code but form a correct causal hypothesis about which component is responsible. When a bug sits at the boundary between two components — a producer and a consumer, a transformer and a validator — both explanations can appear structurally sound from a surface read. Daedalus tests whether agents can be reliably misdirected by a plausible wrong hypothesis at exactly these boundaries.
@@ -42,16 +142,13 @@ Only artifacts that clear both stages are presented for manual review. The outpu
 
 ## Current Status
 
-**Proof of concept.** The fabrication pipeline has been validated on 4 tasks (`django__django-13212`, `django__django-13810`, `django__django-15127`, `django__django-12965`).
+**Active evaluation.** The full pipeline is operational end-to-end.
 
-From the most recent fabrication run (12 proposed):
-- 3 auto-rejected by gates (1 `class_c`, 1 `text_not_found`, 1 `too_short`)
-- 2 retroactively rejected post-review (logger not in scope; commented-out log ≠ Class B)
-- **7 clean accepted artifacts** — all pending Docker safety check and manual review
+- **116 validated tasks** — `root_cause_attribution` variants from `django/django`, cross-validated by DeepSeek V4 Pro scoring Llama 3.3 70B generations
+- **34 approved fabricated artifacts** across 16 tasks — all Class A (comments/docstrings) or Class B (logger calls); 5 manually rejected post-gate for runtime side-effects caught during review
+- **Agent evaluation running** — `evaluate-fabricated` active across DeepSeek V4 Pro, Kimi K2.7 Code, and Qwen3.7-Plus via mini-SWE-agent in SWE-bench Docker containers
 
-No agent-level evaluation against fabricated repositories has been run yet. The `evaluate-swe` command is implemented and tested on small batches, but end-to-end results for the fabrication condition are not yet available.
-
-The problem-statement variant pipeline has generated ~116 `root_cause_attribution` variants from `django/django`, of which 12 passed cross-model re-validation (DeepSeek V4 Pro scoring Llama-generated variants).
+Results and analysis pending completion of evaluation runs.
 
 ## Installation
 
@@ -97,6 +194,19 @@ python examples/fabricate_review.py approve fab_django__django-13212_abc12345
 python examples/fabricate_review.py reject  fab_django__django-13212_abc12345 --notes "too obvious"
 ```
 
+### Fabricated-repository evaluation
+
+```bash
+# Evaluate approved artifacts — runs mini-SWE-agent twice per artifact
+# (clean image, then fabricated image) and compares patches
+daedalus evaluate-fabricated \
+    --tasks examples/output/tasks_v2.jsonl \
+    --fabrications examples/output/fabrications.jsonl \
+    --reviews examples/output/fabrication_approvals.jsonl \
+    --output examples/output/fab_eval_deepseek \
+    --model together_ai/deepseek-ai/DeepSeek-V4-Pro
+```
+
 ### SWE-agent evaluation prerequisites
 
 - **Docker Desktop** must be running. Evaluation degrades gracefully to `resolved=None` when Docker is unavailable.
@@ -125,7 +235,7 @@ Outputs written to `swe_eval/`:
 
 - **Django only:** the current dataset covers `django/django`; multi-repo generation is supported by the pipeline but requires pre-cloning additional repositories.
 - **Single variant type:** only `root_cause_attribution` is implemented.
-- **No fabrication evaluation results yet:** the `evaluate-swe` pipeline is implemented but no aggregate resolved-rate figures under the fabrication condition are available.
+- **Safety checks require Docker:** the PASS_TO_PASS and gold-patch integrity checks in Phase 2 run inside SWE-bench containers. Artifacts fabricated without Docker available are marked `safety: unavailable` and rely on programmatic gates and manual review alone.
 
 ## Design Decisions
 
