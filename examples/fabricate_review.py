@@ -47,28 +47,12 @@ FABRICATIONS_FILE = Path(__file__).parent / "output" / "fabrications.jsonl"
 REJECTIONS_FILE = Path(__file__).parent / "output" / "rejected_fabrications.jsonl"
 REVIEWS_FILE = Path(__file__).parent / "output" / "fabrication_approvals.jsonl"
 
-VALIDATED_IDS = {
-    "django__django-13212",
-    "django__django-13810",
-    "django__django-15127",
-    "django__django-12965",
-    "django__django-13346",
-    "django__django-14580",
-    "django__django-15268",
-    "django__django-13028",
-    "django__django-14122",
-    "django__django-11133",
-    "django__django-13964",
-    "django__django-14608",
-}
-
-
 def _load_tasks() -> dict[str, DaedalusTask]:
     all_tasks = load(TASKS_FILE, DaedalusTask)
     return {
         t.source_instance_id: t
         for t in all_tasks
-        if t.quality_status == "validated" and t.source_instance_id in VALIDATED_IDS
+        if t.quality_status == "validated"
     }
 
 
