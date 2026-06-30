@@ -280,6 +280,103 @@ def load_swebench_metadata(instance_ids: set[str]) -> dict[str, dict]:
 
 
 # ---------------------------------------------------------------------------
+# Fabricated image preparation
+# ---------------------------------------------------------------------------
+
+def _swe_image_name(instance_id: str) -> str:
+    return f"swebench/sweb.eval.x86_64.{instance_id.replace('__', '_1776_')}:latest"
+
+
+def _put_file_in_container(container, name: str, content: str) -> None:
+    import io
+    import tarfile
+    data = content.encode("utf-8")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    buf.seek(0)
+    container.put_archive("/tmp", buf)
+
+
+def prepare_fabricated_image(instance_id: str, diff: str) -> tuple[str, str | None]:
+    """Apply a fabricated diff to the SWE-bench Docker image and retag it locally.
+
+    mini-SWE-agent selects the image by instance_id convention, so retagging the
+    local image causes the agent to see the modified codebase without any config
+    changes. The original image ID is returned so the tag can be restored afterward.
+
+    Returns (image_name, original_image_id). original_image_id is None on failure,
+    in which case the variant runs against the unmodified image.
+    """
+    try:
+        import docker
+        client = docker.from_env()
+        client.ping()
+    except Exception as exc:
+        logger.warning("Docker unavailable — cannot prepare fabricated image: %s", exc)
+        return _swe_image_name(instance_id), None
+
+    image_name = _swe_image_name(instance_id)
+    try:
+        original_image = client.images.get(image_name)
+    except Exception:
+        try:
+            original_image = client.images.pull(image_name)
+        except Exception as exc:
+            logger.warning("Could not get/pull %s: %s", image_name, exc)
+            return image_name, None
+
+    original_id: str = original_image.id
+    container = None
+    try:
+        container = client.containers.run(
+            image_name, "bash", detach=True, tty=True, working_dir="/testbed"
+        )
+        _put_file_in_container(container, "_fab.diff", diff)
+        exit_code, output = container.exec_run(
+            ["bash", "-c",
+             "git apply --whitespace=nowarn /tmp/_fab.diff"
+             " || patch -p1 -f --ignore-whitespace < /tmp/_fab.diff"],
+            workdir="/testbed",
+        )
+        if exit_code != 0:
+            out_str = output.decode("utf-8", errors="replace") if output else ""
+            logger.warning("Could not apply fabricated diff in container: %s", out_str)
+            return image_name, None
+
+        repo, tag = image_name.rsplit(":", 1)
+        container.commit(repository=repo, tag=tag)
+        return image_name, original_id
+
+    except Exception as exc:
+        logger.error("Failed to prepare fabricated image for %s: %s", instance_id, exc)
+        return image_name, None
+    finally:
+        if container is not None:
+            try:
+                container.stop(timeout=10)
+                container.remove(force=True)
+            except Exception:
+                pass
+
+
+def restore_image(image_name: str, original_image_id: str) -> None:
+    """Restore the SWE-bench image tag to the pre-fabrication image."""
+    try:
+        import docker
+        client = docker.from_env()
+        repo, tag = image_name.rsplit(":", 1)
+        client.images.get(original_image_id).tag(repo, tag)
+    except Exception as exc:
+        logger.warning(
+            "Could not restore %s to %s — run: docker pull %s  (%s)",
+            image_name, original_image_id[:12], image_name, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Pair builder
 # ---------------------------------------------------------------------------
 

@@ -84,87 +84,6 @@ def _cmd_generate(args: argparse.Namespace) -> None:
         print(f"\nDone — 0 generated, {errors} errors")
 
 
-def _cmd_evaluate(args: argparse.Namespace) -> None:
-    try:
-        from tqdm import tqdm
-    except ImportError:
-        print("tqdm is required. Run: pip install tqdm", file=sys.stderr)
-        sys.exit(1)
-
-    from daedalus.evaluation.runner import compare_pair, run_condition
-    from daedalus.exporters.jsonl_exporter import export, load, load_source_ids
-    from daedalus.loaders.swebench_loader import load_patches_by_id
-    from daedalus.models.task_schema import DaedalusTask
-
-    tasks_path = Path(args.tasks)
-    runs_path = Path(args.output)
-    pairs_path = runs_path.parent / (runs_path.stem + "_pairs" + runs_path.suffix)
-    repo_path = Path(args.repo_dir)
-
-    if not repo_path.is_dir():
-        print(f"ERROR: --repo-dir not found: {repo_path}", file=sys.stderr)
-        sys.exit(1)
-
-    all_tasks = load(tasks_path, DaedalusTask)
-    tasks = [t for t in all_tasks if t.quality_status == "validated"]
-
-    done_ids = load_source_ids(pairs_path)
-    if done_ids:
-        print(f"Resuming: {len(done_ids)} pairs already in {pairs_path}")
-    tasks = [t for t in tasks if t.source_instance_id not in done_ids]
-
-    if args.limit:
-        tasks = tasks[: args.limit]
-
-    if not tasks:
-        print("No new tasks to evaluate.")
-        return
-
-    print(f"Loading gold patches for {len(tasks)} tasks...")
-    gold_patches = load_patches_by_id({t.source_instance_id for t in tasks})
-    missing = len(tasks) - len(gold_patches)
-    if missing:
-        print(f"  Warning: {missing} patches not found — ownership_label will be 'unknown' for those tasks")
-
-    print(f"Evaluating {len(tasks)} pairs (2 runs each) → {runs_path}")
-    print(f"  Pairs  → {pairs_path}")
-    print(f"  Repo   → {repo_path}")
-
-    bucket_counts: dict[str, int] = {}
-    evaluated = 0
-    errors = 0
-
-    pbar = tqdm(tasks, desc="Evaluating", unit="pair", dynamic_ncols=True)
-    for task in pbar:
-        task_dict = task.model_dump()
-        gold_patch = gold_patches.get(task.source_instance_id, "")
-        try:
-            original_run = run_condition(task_dict, "original", repo_path, gold_patch=gold_patch, model=args.model or None, max_turns=args.max_turns)
-            variant_run = run_condition(task_dict, "variant", repo_path, gold_patch=gold_patch, model=args.model or None, max_turns=args.max_turns)
-            pair = compare_pair(original_run, variant_run)
-
-            export([original_run, variant_run], runs_path, append=True)
-            export([pair], pairs_path, append=True)
-
-            evaluated += 1
-            bucket_counts[pair.evaluation_bucket] = bucket_counts.get(pair.evaluation_bucket, 0) + 1
-        except Exception as exc:
-            errors += 1
-            tqdm.write(f"  ERROR {task.source_instance_id}: {exc}", file=sys.stderr)
-
-        if evaluated:
-            pbar.set_postfix(
-                {b: n for b, n in bucket_counts.items()} | {"err": errors},
-                refresh=False,
-            )
-
-    print(f"\nDone — {evaluated} pairs evaluated, {errors} errors")
-    if bucket_counts:
-        total = sum(bucket_counts.values())
-        print("\nBucket distribution:")
-        for bucket, count in sorted(bucket_counts.items(), key=lambda x: -x[1]):
-            print(f"  {bucket:20s} {count:3d}  ({count / total:.0%})")
-
 
 def _cmd_export_instances(args: argparse.Namespace) -> None:
     import json as _json
@@ -380,27 +299,21 @@ def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
 
     import json as _json
 
-    from daedalus.evaluation.fabricated_runner import run_fabricated_pair
+    from daedalus.evaluation.fabricated_runner import run_swe_fabricated_pair
     from daedalus.exporters.jsonl_exporter import export, load, load_source_ids
     from daedalus.fabricator.schemas import FabricatedArtifact
-    from daedalus.loaders.swebench_loader import load_patches_by_id
     from daedalus.models.task_schema import DaedalusTask
 
     tasks_path = Path(args.tasks)
     fab_path = Path(args.fabrications)
-    repo_path = Path(args.repo_dir)
     output_dir = Path(args.output)
     runs_path = output_dir / "fab_runs.jsonl"
     pairs_path = output_dir / "fab_pairs.jsonl"
 
-    if not repo_path.is_dir():
-        print(f"ERROR: --repo-dir not found: {repo_path}", file=sys.stderr)
-        sys.exit(1)
     if not fab_path.exists():
         print(f"ERROR: fabrications file not found: {fab_path}", file=sys.stderr)
         sys.exit(1)
 
-    # Load tasks
     all_tasks = load(tasks_path, DaedalusTask)
     tasks_by_id = {
         t.source_instance_id: t.model_dump()
@@ -408,7 +321,6 @@ def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
         if t.quality_status == "validated"
     }
 
-    # Load fabrications
     artifacts: dict[str, FabricatedArtifact] = {}
     with fab_path.open(encoding="utf-8") as f:
         for line in f:
@@ -420,7 +332,6 @@ def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
                 except Exception:
                     pass
 
-    # Load review decisions (from separate approvals file or --reviews arg)
     reviews_path = Path(args.reviews) if getattr(args, "reviews", None) else None
     if reviews_path is None:
         reviews_path = fab_path.parent / "fabrication_approvals.jsonl"
@@ -436,7 +347,6 @@ def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
                     except Exception:
                         pass
 
-    # Filter to approved artifacts with a matching task
     approved = [
         a for a in artifacts.values()
         if reviews.get(a.artifact_id, a.review_decision) == "approved"
@@ -448,7 +358,6 @@ def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
         print("No approved artifacts with matching validated tasks found.")
         return
 
-    # Resume support
     done_ids = load_source_ids(pairs_path)
     approved = [a for a in approved if a.artifact_id not in done_ids]
     if done_ids:
@@ -461,11 +370,8 @@ def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
         print("No new artifacts to evaluate.")
         return
 
-    print(f"Loading gold patches for {len({a.source_instance_id for a in approved})} tasks...")
-    gold_patches = load_patches_by_id({a.source_instance_id for a in approved})
-
     output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Evaluating {len(approved)} fabricated artifact(s) → {output_dir}")
+    print(f"Evaluating {len(approved)} fabricated artifact(s) via mini-SWE-agent → {output_dir}")
 
     bucket_counts: dict[str, int] = {}
     evaluated = 0
@@ -474,19 +380,14 @@ def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
     pbar = tqdm(approved, desc="Evaluating", unit="artifact", dynamic_ncols=True)
     for artifact in pbar:
         task = tasks_by_id[artifact.source_instance_id]
-        gold_patch = gold_patches.get(artifact.source_instance_id, "")
         try:
-            orig_run, var_run, pair = run_fabricated_pair(
-                task, artifact, repo_path,
-                gold_patch=gold_patch,
-                model=args.model or None,
-                max_turns=args.max_turns or None,
-            )
-            export([orig_run, var_run], runs_path, append=True)
-            export([pair], pairs_path, append=True)
+            runs, pairs = run_swe_fabricated_pair(task, artifact, output_dir, args.model)
+            export(runs, runs_path, append=True)
+            export(pairs, pairs_path, append=True)
 
             evaluated += 1
-            bucket_counts[pair.evaluation_bucket] = bucket_counts.get(pair.evaluation_bucket, 0) + 1
+            for pair in pairs:
+                bucket_counts[pair.evaluation_bucket] = bucket_counts.get(pair.evaluation_bucket, 0) + 1
         except Exception as exc:
             errors += 1
             tqdm.write(f"  ERROR {artifact.artifact_id}: {exc}", file=sys.stderr)
@@ -564,24 +465,6 @@ def main() -> None:
         help="Directory of locally checked-out repos (reserved for future local-mode generation)",
     )
 
-    # ── evaluate ─────────────────────────────────────────────────────────────
-    ev = subparsers.add_parser(
-        "evaluate",
-        help="Run paired read-only agent evaluation on generated variants",
-    )
-    ev.add_argument("--tasks", required=True, help="Path to DaedalusTask JSONL (output of daedalus generate)")
-    ev.add_argument("--output", required=True, help="Output JSONL path for evaluation runs (pairs written to <stem>_pairs<ext>)")
-    ev.add_argument("--repo-dir", required=True, dest="repo_dir", metavar="DIR",
-                    help="Path to locally checked-out repository matching the tasks file")
-    ev.add_argument(
-        "--limit", type=int, default=None, metavar="N", help="Max pairs to evaluate"
-    )
-    ev.add_argument(
-        "--max-turns", type=int, default=None, metavar="N", dest="max_turns",
-        help=f"Max agent turns per run (default: {__import__('daedalus.evaluation.runner', fromlist=['MAX_TURNS']).MAX_TURNS})",
-    )
-    ev.add_argument("--model", default=None, help="Model for the read-only agent (e.g. deepseek-ai/DeepSeek-V4-Pro, anthropic/claude-sonnet-4-6). Any Together AI or OpenRouter model string works. Defaults to the LLM_PROVIDER-configured model.")
-
     # ── export-instances ──────────────────────────────────────────────────────
     ei = subparsers.add_parser(
         "export-instances",
@@ -627,12 +510,8 @@ def main() -> None:
         help="Path to fabrication_approvals.jsonl (default: adjacent to --fabrications)",
     )
     efab.add_argument("--output", required=True, help="Directory for fab_runs.jsonl and fab_pairs.jsonl")
-    efab.add_argument("--repo-dir", required=True, dest="repo_dir", metavar="DIR",
-                      help="Path to locally checked-out repository")
-    efab.add_argument("--model", default=None,
-                      help="Model for the read-only agent (default: LLM_PROVIDER-configured model)")
-    efab.add_argument("--max-turns", type=int, default=None, metavar="N", dest="max_turns",
-                      help="Max agent turns per run")
+    efab.add_argument("--model", default="deepseek-ai/DeepSeek-V4-Pro",
+                      help="Model for mini-SWE-agent (default: deepseek-ai/DeepSeek-V4-Pro)")
     efab.add_argument("--limit", type=int, default=None, metavar="N",
                       help="Max artifacts to evaluate")
 
@@ -653,8 +532,6 @@ def main() -> None:
 
     if args.command == "generate":
         _cmd_generate(args)
-    elif args.command == "evaluate":
-        _cmd_evaluate(args)
     elif args.command == "export-instances":
         _cmd_export_instances(args)
     elif args.command == "evaluate-swe":

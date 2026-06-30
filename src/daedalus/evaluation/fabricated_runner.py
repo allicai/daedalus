@@ -1,81 +1,53 @@
-"""Paired agent evaluation with fabricated repository artifacts applied to the repo."""
+"""SWE-agent evaluation with fabricated repository artifacts applied via Docker image modification."""
 from __future__ import annotations
 
 import logging
-import subprocess
 from pathlib import Path
 
-from daedalus.evaluation.runner import compare_pair, run_condition
 from daedalus.evaluation.schemas import EvaluationPair, EvaluationRun
+from daedalus.evaluation.swe_runner import (
+    build_swe_pairs,
+    load_swebench_metadata,
+    prepare_fabricated_image,
+    restore_image,
+    run_swe_condition,
+)
 from daedalus.fabricator.schemas import FabricatedArtifact
 
 logger = logging.getLogger(__name__)
 
 
-def _apply_diff(repo_path: Path, diff: str) -> bool:
-    r = subprocess.run(
-        ["git", "apply", "--whitespace=nowarn"],
-        input=diff.encode(),
-        cwd=str(repo_path),
-        capture_output=True,
-    )
-    if r.returncode == 0:
-        return True
-    r = subprocess.run(
-        ["patch", "-p1", "-f", "--ignore-whitespace"],
-        input=diff.encode(),
-        cwd=str(repo_path),
-        capture_output=True,
-    )
-    return r.returncode == 0
-
-
-def _revert_diff(repo_path: Path, diff: str) -> bool:
-    r = subprocess.run(
-        ["git", "apply", "-R", "--whitespace=nowarn"],
-        input=diff.encode(),
-        cwd=str(repo_path),
-        capture_output=True,
-    )
-    return r.returncode == 0
-
-
-def run_fabricated_pair(
+def run_swe_fabricated_pair(
     task: dict,
     artifact: FabricatedArtifact,
-    repo_path: Path,
-    gold_patch: str = "",
-    model: str | None = None,
-    max_turns: int | None = None,
-) -> tuple[EvaluationRun, EvaluationRun, EvaluationPair]:
-    """Run original condition (clean repo) then variant condition (artifact applied).
+    output_dir: Path,
+    model: str,
+) -> tuple[list[EvaluationRun], list[EvaluationPair]]:
+    """Run mini-SWE-agent on original (clean) then variant (fabricated diff applied) condition.
 
-    The diff is reverted after the variant run regardless of outcome. If apply
-    fails, the variant still runs against the unmodified repo and a warning is logged.
+    For the variant condition the fabricated diff is pre-applied to the SWE-bench
+    Docker image before mini-SWE-agent starts, so the agent investigates the modified
+    codebase without knowing about the fabrication. The image tag is restored after
+    the run regardless of outcome.
     """
-    original_run = run_condition(
-        task, "original", repo_path,
-        max_turns=max_turns, gold_patch=gold_patch, model=model,
-    )
+    instance_id = artifact.source_instance_id
+    artifact_dir = output_dir / artifact.artifact_id
 
-    applied = _apply_diff(repo_path, artifact.diff)
-    if not applied:
+    metadata = load_swebench_metadata({instance_id})
+
+    orig_preds_path = run_swe_condition([task], "original", artifact_dir, model)
+
+    image_name, original_image_id = prepare_fabricated_image(instance_id, artifact.diff)
+    if original_image_id is None:
         logger.warning(
-            "Could not apply diff for %s — variant runs on unmodified repo",
+            "Could not apply fabricated diff for %s — variant runs on unmodified image",
             artifact.artifact_id,
         )
 
     try:
-        variant_run = run_condition(
-            task, "variant", repo_path,
-            max_turns=max_turns, gold_patch=gold_patch, model=model,
-        )
+        var_preds_path = run_swe_condition([task], "variant", artifact_dir, model)
     finally:
-        if applied and not _revert_diff(repo_path, artifact.diff):
-            logger.error(
-                "Failed to revert diff for %s — repo at %s may be dirty; run: git checkout -- .",
-                artifact.artifact_id,
-                repo_path,
-            )
+        if original_image_id is not None:
+            restore_image(image_name, original_image_id)
 
-    return original_run, variant_run, compare_pair(original_run, variant_run)
+    return build_swe_pairs([task], orig_preds_path, var_preds_path, metadata)
