@@ -267,6 +267,247 @@ def _cmd_evaluate_swe(args: argparse.Namespace) -> None:
             print(f"  {bucket:20s} {count:3d}  ({count / total:.0%})")
 
 
+def _cmd_report(args: argparse.Namespace) -> None:
+    from collections import Counter
+
+    from daedalus.evaluation.schemas import EvaluationPair, EvaluationRun
+    from daedalus.exporters.jsonl_exporter import load
+
+    pairs_path = Path(args.pairs)
+    if not pairs_path.exists():
+        print(f"ERROR: pairs file not found: {pairs_path}", file=sys.stderr)
+        sys.exit(1)
+
+    pairs = load(pairs_path, EvaluationPair)
+    if not pairs:
+        print("No pairs found.")
+        return
+
+    # Auto-derive runs path: swe_pairs → swe_runs, foo_pairs → foo_runs, foo_pairs → foo
+    runs_by_id: dict[str, EvaluationRun] = {}
+    runs_path = Path(args.runs) if getattr(args, "runs", None) else None
+    if runs_path is None:
+        name = pairs_path.name
+        for candidate_name in (
+            name.replace("_pairs.", "_runs."),
+            name.replace("_pairs.", "."),
+        ):
+            candidate = pairs_path.parent / candidate_name
+            if candidate.exists() and candidate != pairs_path:
+                runs_path = candidate
+                break
+    if runs_path and runs_path.exists():
+        for run in load(runs_path, EvaluationRun):
+            runs_by_id[run.run_id] = run
+
+    total = len(pairs)
+    bucket_counts: Counter = Counter(p.evaluation_bucket for p in pairs)
+
+    W = 60
+    print("=" * W)
+    print("  Daedalus Evaluation Report")
+    print(f"  {pairs_path.name}  ({total} pairs)")
+    print("=" * W)
+
+    print("\n  Bucket distribution")
+    print("  " + "─" * (W - 2))
+    for bucket, count in sorted(bucket_counts.items(), key=lambda x: -x[1]):
+        bar = "█" * count
+        pct = count / total * 100
+        print(f"  {bucket:<22} {count:3d}  ({pct:.0f}%)  {bar}")
+
+    shifted  = sum(1 for p in pairs if p.hypothesis_shifted)
+    diverged = sum(1 for p in pairs if p.trajectory_diverged)
+    print()
+    print(f"  hypothesis_shifted:   {shifted}/{total}")
+    print(f"  trajectory_diverged:  {diverged}/{total}")
+
+    if runs_by_id:
+        resolved_orig = sum(
+            1 for p in pairs
+            if runs_by_id.get(p.original_run_id) and runs_by_id[p.original_run_id].resolved is True
+        )
+        resolved_var = sum(
+            1 for p in pairs
+            if runs_by_id.get(p.variant_run_id) and runs_by_id[p.variant_run_id].resolved is True
+        )
+        evaluated = sum(1 for p in pairs if p.original_resolved is not None)
+        if evaluated:
+            print(f"  resolved (original):  {resolved_orig}/{evaluated}")
+            print(f"  resolved (variant):   {resolved_var}/{evaluated}")
+
+    print(f"\n  Per-task")
+    print("  " + "─" * (W - 2))
+    abbrev = {"correct": "correct", "distractor_adopted": "distract", "other": "other", "unknown": "?"}
+    print(f"  {'Instance':32s}  {'Bucket':20s}  {'Orig→Var':18s}  {'Dist':4s}  {'ΔT':>3s}")
+    for p in sorted(pairs, key=lambda x: x.evaluation_bucket):
+        iid = p.source_instance_id
+        if len(iid) > 32:
+            iid = "…" + iid[-31:]
+        ol = abbrev.get(p.original_ownership_label, p.original_ownership_label[:8])
+        vl = abbrev.get(p.variant_ownership_label, p.variant_ownership_label[:8])
+        dist = f"{'Y' if p.original_distractor_visited else 'N'}/{'Y' if p.variant_distractor_visited else 'N'}"
+        dt = f"{p.turns_delta:+d}" if p.turns_delta != 0 else "0"
+        print(f"  {iid:32s}  {p.evaluation_bucket:20s}  {ol:8s}→{vl:8s}  {dist:4s}  {dt:>3s}")
+
+    clean_pairs = [p for p in pairs if p.hypothesis_shifted]
+    if clean_pairs:
+        print(f"\n  {'═' * (W - 2)}")
+        print(f"  CLEAN SHIFT CASES ({len(clean_pairs)})")
+        print(f"  {'═' * (W - 2)}")
+        for p in clean_pairs:
+            print(f"\n  {p.source_instance_id}")
+            for condition, run_id in (("original", p.original_run_id), ("variant", p.variant_run_id)):
+                run = runs_by_id.get(run_id)
+                if not run:
+                    continue
+                dist_note = " [distractor visited]" if run.distractor_file_visited else ""
+                print(f"\n    [{condition.upper()}]  {run.turns} turns, {run.unique_files_opened} files{dist_note}")
+                if run.ownership_assignment:
+                    print(f"    Ownership: {run.ownership_assignment}")
+                if run.reasoning:
+                    text = run.reasoning.replace("\n", " ")
+                    print(f"    Reasoning: {text[:280]}")
+            print(f"\n  {'─' * (W - 2)}")
+
+
+def _cmd_evaluate_fabricated(args: argparse.Namespace) -> None:
+    try:
+        from tqdm import tqdm
+    except ImportError:
+        print("tqdm is required. Run: pip install tqdm", file=sys.stderr)
+        sys.exit(1)
+
+    import json as _json
+
+    from daedalus.evaluation.fabricated_runner import run_fabricated_pair
+    from daedalus.exporters.jsonl_exporter import export, load, load_source_ids
+    from daedalus.fabricator.schemas import FabricatedArtifact
+    from daedalus.loaders.swebench_loader import load_patches_by_id
+    from daedalus.models.task_schema import DaedalusTask
+
+    tasks_path = Path(args.tasks)
+    fab_path = Path(args.fabrications)
+    repo_path = Path(args.repo_dir)
+    output_dir = Path(args.output)
+    runs_path = output_dir / "fab_runs.jsonl"
+    pairs_path = output_dir / "fab_pairs.jsonl"
+
+    if not repo_path.is_dir():
+        print(f"ERROR: --repo-dir not found: {repo_path}", file=sys.stderr)
+        sys.exit(1)
+    if not fab_path.exists():
+        print(f"ERROR: fabrications file not found: {fab_path}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load tasks
+    all_tasks = load(tasks_path, DaedalusTask)
+    tasks_by_id = {
+        t.source_instance_id: t.model_dump()
+        for t in all_tasks
+        if t.quality_status == "validated"
+    }
+
+    # Load fabrications
+    artifacts: dict[str, FabricatedArtifact] = {}
+    with fab_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    a = FabricatedArtifact.model_validate_json(line)
+                    artifacts[a.artifact_id] = a
+                except Exception:
+                    pass
+
+    # Load review decisions (from separate approvals file or --reviews arg)
+    reviews_path = Path(args.reviews) if getattr(args, "reviews", None) else None
+    if reviews_path is None:
+        reviews_path = fab_path.parent / "fabrication_approvals.jsonl"
+    reviews: dict[str, str] = {}
+    if reviews_path.exists():
+        with reviews_path.open(encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        r = _json.loads(line)
+                        reviews[r["artifact_id"]] = r["decision"]
+                    except Exception:
+                        pass
+
+    # Filter to approved artifacts with a matching task
+    approved = [
+        a for a in artifacts.values()
+        if reviews.get(a.artifact_id, a.review_decision) == "approved"
+        and a.source_instance_id in tasks_by_id
+        and a.safety_result not in ("failed_tests", "failed_gold_patch", "patch_error")
+    ]
+
+    if not approved:
+        print("No approved artifacts with matching validated tasks found.")
+        return
+
+    # Resume support
+    done_ids = load_source_ids(pairs_path)
+    approved = [a for a in approved if a.artifact_id not in done_ids]
+    if done_ids:
+        print(f"Resuming: {len(done_ids)} artifact(s) already evaluated")
+
+    if args.limit:
+        approved = approved[: args.limit]
+
+    if not approved:
+        print("No new artifacts to evaluate.")
+        return
+
+    print(f"Loading gold patches for {len({a.source_instance_id for a in approved})} tasks...")
+    gold_patches = load_patches_by_id({a.source_instance_id for a in approved})
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Evaluating {len(approved)} fabricated artifact(s) → {output_dir}")
+
+    bucket_counts: dict[str, int] = {}
+    evaluated = 0
+    errors = 0
+
+    pbar = tqdm(approved, desc="Evaluating", unit="artifact", dynamic_ncols=True)
+    for artifact in pbar:
+        task = tasks_by_id[artifact.source_instance_id]
+        gold_patch = gold_patches.get(artifact.source_instance_id, "")
+        try:
+            orig_run, var_run, pair = run_fabricated_pair(
+                task, artifact, repo_path,
+                gold_patch=gold_patch,
+                model=args.model or None,
+                max_turns=args.max_turns or None,
+            )
+            export([orig_run, var_run], runs_path, append=True)
+            export([pair], pairs_path, append=True)
+
+            evaluated += 1
+            bucket_counts[pair.evaluation_bucket] = bucket_counts.get(pair.evaluation_bucket, 0) + 1
+        except Exception as exc:
+            errors += 1
+            tqdm.write(f"  ERROR {artifact.artifact_id}: {exc}", file=sys.stderr)
+
+        if evaluated:
+            pbar.set_postfix(
+                {b: n for b, n in bucket_counts.items()} | {"err": errors},
+                refresh=False,
+            )
+
+    print(f"\nDone — {evaluated} pairs evaluated, {errors} errors")
+    print(f"  Runs  → {runs_path}")
+    print(f"  Pairs → {pairs_path}")
+    if bucket_counts:
+        total = sum(bucket_counts.values())
+        print("\nBucket distribution:")
+        for bucket, count in sorted(bucket_counts.items(), key=lambda x: -x[1]):
+            print(f"  {bucket:20s} {count:3d}  ({count / total:.0%})")
+    print(f"\nView results:  daedalus report --pairs {pairs_path}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="daedalus",
@@ -371,6 +612,40 @@ def main() -> None:
     )
     eswe.add_argument("--limit", type=int, default=None, metavar="N", help="Max pairs to evaluate")
 
+    # ── evaluate-fabricated ───────────────────────────────────────────────────
+    efab = subparsers.add_parser(
+        "evaluate-fabricated",
+        help="Run read-only agent evaluation with fabricated repo artifacts applied",
+    )
+    efab.add_argument("--tasks", required=True, help="Path to DaedalusTask JSONL")
+    efab.add_argument(
+        "--fabrications", required=True, metavar="FILE",
+        help="Path to fabrications.jsonl (output of fabricate_review.py generate)",
+    )
+    efab.add_argument(
+        "--reviews", default=None, metavar="FILE",
+        help="Path to fabrication_approvals.jsonl (default: adjacent to --fabrications)",
+    )
+    efab.add_argument("--output", required=True, help="Directory for fab_runs.jsonl and fab_pairs.jsonl")
+    efab.add_argument("--repo-dir", required=True, dest="repo_dir", metavar="DIR",
+                      help="Path to locally checked-out repository")
+    efab.add_argument("--model", default=None,
+                      help="Model for the read-only agent (default: LLM_PROVIDER-configured model)")
+    efab.add_argument("--max-turns", type=int, default=None, metavar="N", dest="max_turns",
+                      help="Max agent turns per run")
+    efab.add_argument("--limit", type=int, default=None, metavar="N",
+                      help="Max artifacts to evaluate")
+
+    # ── report ───────────────────────────────────────────────────────────────
+    rep = subparsers.add_parser(
+        "report",
+        help="Print a human-readable summary of evaluation pairs output",
+    )
+    rep.add_argument("--pairs", required=True, metavar="FILE",
+                     help="Path to *_pairs.jsonl (from evaluate, evaluate-swe, or evaluate-fabricated)")
+    rep.add_argument("--runs", default=None, metavar="FILE",
+                     help="Path to *_runs.jsonl for agent reasoning details (auto-derived if omitted)")
+
     args = parser.parse_args()
     if args.command is None:
         parser.print_help()
@@ -384,3 +659,7 @@ def main() -> None:
         _cmd_export_instances(args)
     elif args.command == "evaluate-swe":
         _cmd_evaluate_swe(args)
+    elif args.command == "evaluate-fabricated":
+        _cmd_evaluate_fabricated(args)
+    elif args.command == "report":
+        _cmd_report(args)
