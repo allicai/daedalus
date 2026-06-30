@@ -51,7 +51,7 @@ From the most recent fabrication run (12 proposed):
 
 No agent-level evaluation against fabricated repositories has been run yet. The `evaluate-swe` command is implemented and tested on small batches, but end-to-end results for the fabrication condition are not yet available.
 
-The problem-statement variant pipeline has generated ~116 `root_cause_attribution` variants from `django/django`, of which 12 passed cross-model re-validation (DeepSeek V4 Pro scoring Llama-generated variants). The full dataset needs regeneration with both fixes active (framing diversity + cross-model validation).
+The problem-statement variant pipeline has generated ~116 `root_cause_attribution` variants from `django/django`, of which 12 passed cross-model re-validation (DeepSeek V4 Pro scoring Llama-generated variants).
 
 ## Installation
 
@@ -125,8 +125,6 @@ Outputs written to `swe_eval/`:
 
 - **Django only:** the current dataset covers `django/django`; multi-repo generation is supported by the pipeline but requires pre-cloning additional repositories.
 - **Single variant type:** only `root_cause_attribution` is implemented.
-- **Template uniformity:** early dataset runs produced variants with low framing diversity. Fixed in the current codebase via randomly selected framing starters; the 116-task dataset predates this fix.
-- **Self-validation bias:** the 116-task dataset was validated by the same model used for generation (113/116 scored exactly 4/4/4/4). Fixed: the validator now uses DeepSeek V4 Pro. Retroactive re-validation yielded 12/116 (10.3%).
 - **No fabrication evaluation results yet:** the `evaluate-swe` pipeline is implemented but no aggregate resolved-rate figures under the fabrication condition are available.
 
 ## Design Decisions

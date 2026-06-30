@@ -50,7 +50,7 @@ def _cmd_generate(args: argparse.Namespace) -> None:
 
     print(f"Processing {len(tasks)} tasks → {output_path}")
     if args.repo_dir:
-        print(f"Note: --repo-dir is accepted but generation uses GitHub API for now.")
+        print(f"Note: --repo-dir is accepted but generation uses the GitHub API; the local checkout is not read.")
 
     generated = 0
     validated = 0
@@ -567,7 +567,7 @@ def main() -> None:
     # ── evaluate ─────────────────────────────────────────────────────────────
     ev = subparsers.add_parser(
         "evaluate",
-        help="Run paired agent evaluation on generated variants (stub — coming soon)",
+        help="Run paired read-only agent evaluation on generated variants",
     )
     ev.add_argument("--tasks", required=True, help="Path to DaedalusTask JSONL (output of daedalus generate)")
     ev.add_argument("--output", required=True, help="Output JSONL path for evaluation runs (pairs written to <stem>_pairs<ext>)")
